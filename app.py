@@ -11,6 +11,12 @@ from pathlib import Path
 from datetime import datetime
 import plotly.graph_objects as go
 
+# Load .env so MASSIVE_* keys are available locally and on Streamlit Cloud
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).parent / ".env", override=False)
+
+from massive_loader import load_massive_history, refresh_massive_cache
+
 # ─── PAGE CONFIG ────────────────────────────────────────────
 st.set_page_config(
     page_title="JPSI High/Low Futures Model",
@@ -318,11 +324,18 @@ def _load_sn(wb, name, is_low):
 @st.cache_data
 def load_price_history():
     """
-    Parse both wide-format futures price files.
-    Returns (data_dict, error_str).
-    data_dict = {"corn": {ticker: df}, "soy": {ticker: df}} on success, or None on failure.
-    error_str = None on success, diagnostic string on failure.
+    Load futures price history.
+    Priority 1: Massive flat-file cache (boto3 S3, auto-updated).
+    Priority 2: Local Excel files (manual drop-in / SharePoint sync).
+    Returns (data_dict, error_str, source_label).
+    data_dict = {"corn": {ticker: df}, "soy": {ticker: df}} or None on failure.
     """
+    # ── Try Massive cache first ───────────────────────────────
+    massive_data, massive_err = load_massive_history()
+    if massive_data is not None:
+        return massive_data, None, "Massive"
+
+    # ── Fall back to Excel files ──────────────────────────────
     corn_path = _CORN_PRIMARY if _CORN_PRIMARY.exists() else _CORN_LOCAL
     soy_path  = _SOY_PRIMARY  if _SOY_PRIMARY.exists()  else _SOY_LOCAL
 
@@ -332,7 +345,10 @@ def load_price_history():
     if not soy_path.exists():
         missing.append(f"Soy:  {soy_path}")
     if missing:
-        return None, "Files not found:\n" + "\n".join(missing)
+        return None, (
+            f"No Massive cache yet ({massive_err}) and Excel files not found:\n"
+            + "\n".join(missing)
+        ), None
 
     def parse_file(path):
         contracts = {}
@@ -360,9 +376,9 @@ def load_price_history():
         return contracts
 
     try:
-        return {"corn": parse_file(corn_path), "soy": parse_file(soy_path)}, None
+        return {"corn": parse_file(corn_path), "soy": parse_file(soy_path)}, None, "Excel"
     except Exception as e:
-        return None, f"Parse error: {e}"
+        return None, f"Excel parse error: {e}", None
 
 
 def _ticker_year(ticker):
@@ -969,7 +985,7 @@ with hdr_r:
 st.markdown('<div style="height:12px;"></div>', unsafe_allow_html=True)
 
 # ─── LOAD PRICE HISTORY ─────────────────────────────────────
-PH, PH_ERR = load_price_history()
+PH, PH_ERR, PH_SOURCE = load_price_history()
 
 # ─── TOP-LEVEL TABS ─────────────────────────────────────────
 tab_ov, tab_inp, tab_cz, tab_cn, tab_sx, tab_sn, tab_seas = st.tabs([
@@ -1469,18 +1485,29 @@ with tab_sn:
 # SEASONALS TAB
 # ══════════════════════════════════════════════════════════════
 with tab_seas:
-    hd_col, btn_col = st.columns([5, 1])
+    hd_col, src_col, btn_col = st.columns([4, 1, 1])
     with hd_col:
-        st.markdown('<div class="sec-hdr">📈 Seasonal Price Patterns — % of Jan 1</div>',
+        st.markdown('<div class="sec-hdr">📈 Seasonal Price Patterns</div>',
                     unsafe_allow_html=True)
+    with src_col:
+        if PH_SOURCE:
+            src_color = "#5e7164" if PH_SOURCE == "Massive" else "#c4b456"
+            st.markdown(
+                f'<div style="margin-top:22px;font-size:0.75rem;color:{src_color};">'
+                f'📡 Source: <b>{PH_SOURCE}</b></div>',
+                unsafe_allow_html=True,
+            )
     with btn_col:
-        st.markdown('<div style="height:20px;"></div>', unsafe_allow_html=True)
-        if st.button("🔄 Refresh Data", key="refresh_price_btn", use_container_width=True,
-                     help="Pulls the latest files from the SharePoint-synced folder and reloads the charts."):
-            with st.spinner("Copying latest files…"):
-                ok, msg = refresh_price_files()
+        st.markdown('<div style="height:14px;"></div>', unsafe_allow_html=True)
+        if st.button("⬇️ Refresh Massive", key="refresh_massive_btn", use_container_width=True,
+                     help="Download latest CBOT session data from Massive (ZC/ZS futures)."):
+            with st.spinner("Downloading from Massive S3…"):
+                ok, msg = refresh_massive_cache()
+            load_price_history.clear()
             if ok:
-                st.toast(msg, icon="✅")
+                st.success("Massive cache updated.")
+                with st.expander("Details", expanded=False):
+                    st.text(msg)
             else:
                 st.error(msg)
             st.rerun()

@@ -2,3 +2,9 @@
 __pycache__/
 *.pyc
 .env
+
+# Secrets (never commit credentials)
+.streamlit/secrets.toml
+
+# Massive local cache (downloaded data, not source)
+data/massive_cache/
